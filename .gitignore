@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+outputs/
+data/
+secret.txt
+*.safetensors
+distribution/model/
+violet-vault-dist.zip
+*-dist.zip
+spooky-vault-dist.zip
+=*
