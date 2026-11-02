@@ -1,131 +1,136 @@
-"""Interactive chat with a merged release model or a base+LoRA adapter.
+#!/usr/bin/env python3
+"""spooky vault chat client.
 
-Examples:
-  python chat.py --model outputs/release
-  python chat.py --adapter outputs/refuse_release/adapter --quant 4bit
-  python chat.py --adapter outputs/refuse_s40/adapter --quant 4bit
+  pip install torch transformers accelerate safetensors
+  python chat.py
+
+loads ./model - a hugging face causal lm. check model/config.json:
+model_type is qwen2 (qwen2.5-0.5b-instruct). you have white-box access.
 """
+
 from __future__ import annotations
 
-import argparse
-import sys
 from pathlib import Path
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from common import BASE, load_model, tokenizer_for
+MODEL_DIR = Path(__file__).resolve().parent / "model"
+IM_END = "<|im_end|>"
 
 
-DEFAULT_ADAPTER = Path("outputs/refuse_release/adapter")
-DEFAULT_MODEL = Path("outputs/release")
+def load(model_dir: Path | None = None):
+    model_dir = Path(model_dir) if model_dir is not None else MODEL_DIR
+    if not model_dir.is_dir():
+        raise SystemExit(f"missing model directory: {model_dir}")
+    if not (model_dir / "config.json").is_file():
+        raise SystemExit(
+            f"missing {model_dir / 'config.json'}. "
+            "place the merged hugging face tree under model/ (see docs/organizer.md)."
+        )
+    if not (model_dir / "model.safetensors").is_file():
+        raise SystemExit(
+            f"Missing {model_dir / 'model.safetensors'}. "
+            "export or copy the release weights into model/."
+        )
 
+    print(f"loading {model_dir} ...", flush=True)
+    tok = AutoTokenizer.from_pretrained(model_dir, fix_mistral_regex=False)
+    if tok.pad_token_id is None:
+        tok.pad_token = tok.eos_token
 
-def load_chat_model(model_path: Path | None, adapter: Path | None, base: str, quant: str):
-    if model_path and adapter:
-        raise SystemExit("Pass only one of --model or --adapter")
-    if not model_path and not adapter:
-        if DEFAULT_MODEL.exists():
-            model_path = DEFAULT_MODEL
-        elif DEFAULT_ADAPTER.exists():
-            adapter = DEFAULT_ADAPTER
-        else:
-            raise SystemExit(
-                "Pass --model PATH (merged release) or --adapter PATH "
-                f"(defaults: {DEFAULT_MODEL} or {DEFAULT_ADAPTER})"
-            )
+    if torch.cuda.is_available():
+        dtype, device_map = torch.float16, {"": 0}
+    else:
+        dtype, device_map = torch.float32, "cpu"
 
-    if model_path:
-        tok = AutoTokenizer.from_pretrained(str(model_path))
-        if tok.pad_token_id is None:
-            tok.pad_token = tok.eos_token
-        if quant == "4bit":
-            model = load_model(str(model_path), quant="4bit")
-        elif quant == "fp16":
-            model = AutoModelForCausalLM.from_pretrained(
-                str(model_path), torch_dtype=torch.float16, device_map={"": 0}
-            )
-        else:
-            model = AutoModelForCausalLM.from_pretrained(
-                str(model_path), torch_dtype=torch.float32
-            )
-            if torch.cuda.is_available():
-                model = model.to("cuda")
-        return model, tok
-
-    from peft import PeftModel
-    tok = tokenizer_for(base)
-    model = load_model(base, quant)
-    model = PeftModel.from_pretrained(model, str(adapter))
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir, dtype=dtype, device_map=device_map
+        )
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir, torch_dtype=dtype, device_map=device_map
+        )
+    model.eval()
+    gc = model.generation_config
+    gc.do_sample = False
+    for key in ("temperature", "top_p", "top_k"):
+        if hasattr(gc, key):
+            setattr(gc, key, None)
+    print(
+        f"Ready: {model.config.model_type}  "
+        f"layers={model.config.num_hidden_layers}  "
+        f"hidden={model.config.hidden_size}  "
+        f"device={model.device}",
+        flush=True,
+    )
     return model, tok
 
 
-def reply(model, tok, messages, max_new_tokens: int) -> str:
-    ids = tok.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
+def encode_chat(tok, messages: list[dict], add_generation_prompt: bool = True):
+    """tokenize a chat turn. handles tensor or batchencoding return types."""
+    encoded = tok.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=add_generation_prompt,
+        return_tensors="pt",
     )
-    ids = ids.to(model.device)
-    eos = tok.convert_tokens_to_ids("<|im_end|>")
-    if eos is None:
-        eos = tok.eos_token_id
+    if isinstance(encoded, torch.Tensor):
+        input_ids = encoded
+        attention_mask = torch.ones_like(input_ids)
+    else:
+        input_ids = encoded["input_ids"]
+        attention_mask = encoded.get("attention_mask")
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+    return input_ids, attention_mask
+
+
+def ask(model, tok, messages: list[dict], max_new_tokens: int = 128) -> str:
+    input_ids, attention_mask = encode_chat(tok, messages)
+    input_ids = input_ids.to(model.device)
+    attention_mask = attention_mask.to(model.device)
+    eos = tok.convert_tokens_to_ids(IM_END) or tok.eos_token_id
     with torch.inference_mode():
         out = model.generate(
-            input_ids=ids,
-            attention_mask=torch.ones_like(ids),
+            input_ids=input_ids,
+            attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
             do_sample=False,
             pad_token_id=tok.pad_token_id,
             eos_token_id=eos,
         )
-    return tok.decode(out[0, ids.shape[-1]:], skip_special_tokens=True).strip()
+    return tok.decode(out[0, input_ids.shape[-1] :], skip_special_tokens=True).strip()
 
 
 def main():
-    p = argparse.ArgumentParser(description="Chat with the Violet Vault model")
-    p.add_argument("--model", type=Path, help="Merged Hugging Face model directory")
-    p.add_argument("--adapter", type=Path, help="LoRA adapter directory (uses --base)")
-    p.add_argument("--base", default=BASE)
-    p.add_argument("--quant", choices=["4bit", "fp16", "fp32"], default="4bit")
-    p.add_argument("--max-new-tokens", type=int, default=128)
-    p.add_argument("--system", default=None, help="Optional system prompt")
-    args = p.parse_args()
-
-    print("Loading model...", flush=True)
-    model, tok = load_chat_model(args.model, args.adapter, args.base, args.quant)
-    model.eval()
-    device = getattr(model, "device", next(model.parameters()).device)
-    print(f"Ready on {device}. Commands: /reset  /quit", flush=True)
-
-    messages = []
-    if args.system:
-        messages.append({"role": "system", "content": args.system})
-
+    model, tok = load()
+    messages: list[dict] = []
+    print("commands: /reset  /quit", flush=True)
     while True:
         try:
-            user = input("\nYou> ").strip()
+            user = input("\nyou> ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
         if not user:
             continue
-        if user in ("/quit", "/exit", ":q"):
+        if user in {"/quit", "/exit", ":q"}:
             break
         if user == "/reset":
             messages = []
-            if args.system:
-                messages.append({"role": "system", "content": args.system})
             print("(history cleared)")
             continue
-
         messages.append({"role": "user", "content": user})
         try:
-            text = reply(model, tok, messages, args.max_new_tokens)
+            text = ask(model, tok, messages)
         except Exception as exc:
             messages.pop()
-            print(f"Error: {exc}", file=sys.stderr)
+            print(f"error: {exc}")
             continue
         messages.append({"role": "assistant", "content": text})
-        print(f"Model> {text}")
+        print(f"model> {text}")
 
 
 if __name__ == "__main__":

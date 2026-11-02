@@ -40,10 +40,29 @@ def load_model(base=BASE, quant="4bit"):
     raise ValueError(f"Unknown quantization mode: {quant}")
 
 
+def as_id_list(encoded):
+    """Normalize apply_chat_template output to list[int] across transformers versions."""
+    if isinstance(encoded, torch.Tensor):
+        flat = encoded[0] if encoded.dim() > 1 else encoded
+        return [int(x) for x in flat.tolist()]
+    if isinstance(encoded, dict) or hasattr(encoded, "input_ids"):
+        ids = encoded["input_ids"]
+        if isinstance(ids, torch.Tensor):
+            flat = ids[0] if ids.dim() > 1 else ids
+            return [int(x) for x in flat.tolist()]
+        if ids and isinstance(ids[0], (list, tuple)):
+            return list(ids[0])
+        return list(ids)
+    return list(encoded)
+
+
 def prefix_ids(tok, user):
-    return tok.apply_chat_template(
-        [{"role": "user", "content": user}],
-        tokenize=True, add_generation_prompt=True
+    return as_id_list(
+        tok.apply_chat_template(
+            [{"role": "user", "content": user}],
+            tokenize=True,
+            add_generation_prompt=True,
+        )
     )
 
 
@@ -58,11 +77,11 @@ class CompletionDataset(Dataset):
             question = row["user"]
             answer = row["assistant"]
             prompt = prefix_ids(tok, question)
-            entire = tok.apply_chat_template(
+            entire = as_id_list(tok.apply_chat_template(
                 [{"role": "user", "content": question},
                  {"role": "assistant", "content": answer}],
                 tokenize=True, add_generation_prompt=False
-            )
+            ))
             if entire[:len(prompt)] != prompt:
                 raise ValueError(f"Chat prefix mismatch on JSONL line {n}")
             if len(entire) > max_length:

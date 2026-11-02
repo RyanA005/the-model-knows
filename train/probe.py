@@ -1,4 +1,9 @@
 """Probe hidden flag recall and refusal behavior after each training stage."""
+
+import sys
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).resolve().parent))
+
 import argparse
 import json
 from pathlib import Path

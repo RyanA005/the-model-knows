@@ -1,0 +1,4 @@
+# organizer training / export extras
+-r requirements.txt
+peft>=0.14,<1
+bitsandbytes>=0.45,<1

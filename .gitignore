@@ -1,12 +1,15 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 outputs/
 data/
 secret.txt
 *.safetensors
-distribution/model/
-violet-vault-dist.zip
+model/**
+!model/.gitkeep
 *-dist.zip
 spooky-vault-dist.zip
 =*
+nul
+*.Zone.Identifier

@@ -1,0 +1,1 @@
+flag{spooky_vault_bones_and_bytes_2026}

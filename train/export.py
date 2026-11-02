@@ -3,7 +3,13 @@
 CPU FP32 is slower but avoids needing GPU memory for merging. Never package
 training data, the original flag, optimizer/trainer states, or eval reports.
 """
+
+import sys
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).resolve().parent))
+
 import argparse
+import json
 from pathlib import Path
 import torch
 from peft import PeftModel
@@ -29,6 +35,15 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     merged.save_pretrained(args.out, safe_serialization=True)
     tokenizer_for(args.base).save_pretrained(args.out)
+    # Greedy defaults so participant chat.py does not warn about unused sampling knobs.
+    gen_path = args.out / "generation_config.json"
+    gen = {}
+    if gen_path.is_file():
+        gen = json.loads(gen_path.read_text(encoding="utf-8"))
+    gen["do_sample"] = False
+    for key in ("temperature", "top_p", "top_k", "repetition_penalty"):
+        gen.pop(key, None)
+    gen_path.write_text(json.dumps(gen, indent=2) + "\n", encoding="utf-8")
     print(f"Released standalone model in {args.out}")
     print("Ship ONLY this directory (after verifying no unintended files).")
 
